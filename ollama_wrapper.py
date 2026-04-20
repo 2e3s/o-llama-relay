@@ -234,7 +234,12 @@ class OllamaHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         print(f"[OLLAMA] GET {self.path}")
-        if self.path == "/api/tags":
+        if self.path == "/" or self.path == "":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Ollama is running")
+        elif self.path == "/api/tags":
             self.handle_tags()
         elif self.path == "/api/ps":
             self.handle_ps()
