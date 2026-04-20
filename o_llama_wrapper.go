@@ -15,17 +15,32 @@ import (
 )
 
 const (
-	Version    = "0.1.0"
+	Version     = "0.1.0"
 	DefaultPort = 11434
 )
 
-var llamaCPPURL = getEnv("LLAMA_CPP_URL", "http://127.0.0.1:8080")
+var (
+	llamaCPPURL  = getEnv("LLAMA_CPP_URL", "http://127.0.0.1:8080")
+	verboseLevel int // 0=silent, 1=verbose, 2=very verbose
+)
 
 func getEnv(key, defaultVal string) string {
 	if val := os.Getenv(key); val != "" {
 		return val
 	}
 	return defaultVal
+}
+
+func logVerbose(format string, args ...interface{}) {
+	if verboseLevel >= 1 {
+		log.Printf(format, args...)
+	}
+}
+
+func logVeryVerbose(format string, args ...interface{}) {
+	if verboseLevel >= 2 {
+		log.Printf(format, args...)
+	}
 }
 
 type ErrorResponse struct {
@@ -44,12 +59,12 @@ func sendError(w http.ResponseWriter, message string, status int) {
 
 func fetchFromLlama(path string, data interface{}, method string) (map[string]interface{}, error) {
 	url := llamaCPPURL + path
-	log.Printf("[LLAMA] %s %s", method, url)
+	logVerbose("[LLAMA] %s %s", method, url)
 
 	var body []byte
 	if data != nil {
 		body, _ = json.Marshal(data)
-		log.Printf("[LLAMA] Payload: %s", string(body))
+		logVeryVerbose("[LLAMA] Payload: %s", string(body))
 	}
 
 	req, err := http.NewRequest(method, url, bytes.NewReader(body))
@@ -58,21 +73,21 @@ func fetchFromLlama(path string, data interface{}, method string) (map[string]in
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	log.Printf("[LLAMA] Opening URL, waiting for response...")
+	logVeryVerbose("[LLAMA] Opening URL, waiting for response...")
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[LLAMA] URLError: %v", err)
+		logVerbose("[LLAMA] URLError: %v", err)
 		return nil, fmt.Errorf("failed to reach Llama.cpp server: %v", err)
 	}
 	defer resp.Body.Close()
 
-	log.Printf("[LLAMA] Got response, reading...")
+	logVeryVerbose("[LLAMA] Got response, reading...")
 	result, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	log.Printf("[LLAMA] Response received: %d bytes", len(result))
+	logVeryVerbose("[LLAMA] Response received: %d bytes", len(result))
 
 	var dataMap map[string]interface{}
 	if err := json.Unmarshal(result, &dataMap); err != nil {
@@ -102,7 +117,7 @@ func estimateModelSize(filename string) int64 {
 
 func parseModelDetails(filename string) map[string]string {
 	details := map[string]string{
-		"format":              "gguf",
+		"format":             "gguf",
 		"family":             "unknown",
 		"families":           "unknown",
 		"parameter_size":     "unknown",
@@ -204,7 +219,7 @@ func llamaToOllamaTags(llamaData map[string]interface{}) map[string]interface{} 
 		}
 
 		details := map[string]string{
-			"format":              "gguf",
+			"format":             "gguf",
 			"family":             "unknown",
 			"families":           "[\"unknown\"]",
 			"parameter_size":     "unknown",
@@ -271,12 +286,12 @@ func llamaToOllamaPS(llamaData map[string]interface{}) map[string]interface{} {
 		expiresAt = expiresAt.Truncate(time.Minute)
 
 		modelEntry := map[string]interface{}{
-			"name": modelID,
-			"model": modelID,
-			"size": 0,
+			"name":   modelID,
+			"model":  modelID,
+			"size":   0,
 			"digest": "",
 			"details": map[string]string{
-				"format":              "gguf",
+				"format":             "gguf",
 				"family":             "unknown",
 				"families":           "[\"unknown\"]",
 				"parameter_size":     "unknown",
@@ -295,7 +310,7 @@ func llamaToOllamaPS(llamaData map[string]interface{}) map[string]interface{} {
 type OllamaHandler struct{}
 
 func (h *OllamaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[OLLAMA] %s %s", r.Method, r.URL.Path)
+	logVerbose("[OLLAMA] %s %s", r.Method, r.URL.Path)
 
 	switch r.Method {
 	case "GET":
@@ -331,7 +346,7 @@ func (h *OllamaHandler) handlePost(w http.ResponseWriter, r *http.Request) {
 		sendError(w, "Failed to read request body", 400)
 		return
 	}
-	log.Printf("[OLLAMA] POST %s Body: %s", r.URL.Path, truncateString(string(body), 500))
+	logVeryVerbose("[OLLAMA] POST body: %s", truncateString(string(body), 500))
 
 	var reqBody map[string]interface{}
 	if err := json.Unmarshal(body, &reqBody); err != nil {
@@ -438,7 +453,7 @@ func (h *OllamaHandler) handleGenerate(w http.ResponseWriter, reqBody map[string
 
 	sendJSON(w, map[string]interface{}{
 		"model":       model,
-		"created_at": time.Now().UTC().Format(time.RFC3339),
+		"created_at":  time.Now().UTC().Format(time.RFC3339),
 		"response":    response,
 		"done":        true,
 		"done_reason": "stop",
@@ -446,7 +461,7 @@ func (h *OllamaHandler) handleGenerate(w http.ResponseWriter, reqBody map[string
 
 	// Handle keep_alive: 0 means unload model
 	if shouldUnload(keepAlive) {
-		log.Printf("[DEBUG] Unloading model: %s", model)
+		logVerbose("[DEBUG] Unloading model: %s", model)
 		fetchFromLlama("/models/unload", map[string]string{"model": model}, "POST")
 	}
 }
@@ -504,7 +519,7 @@ func (h *OllamaHandler) handleChat(w http.ResponseWriter, reqBody map[string]int
 
 	// Handle keep_alive: 0 means unload model
 	if shouldUnload(keepAlive) {
-		log.Printf("[DEBUG] Unloading model: %s", model)
+		logVerbose("[DEBUG] Unloading model: %s", model)
 		fetchFromLlama("/models/unload", map[string]string{"model": model}, "POST")
 	}
 }
@@ -526,8 +541,8 @@ func (h *OllamaHandler) handleEmbed(w http.ResponseWriter, reqBody map[string]in
 	}
 
 	llamaData := map[string]interface{}{
-		"model":  model,
-		"input":  inputList,
+		"model": model,
+		"input": inputList,
 	}
 
 	result, err := fetchFromLlama("/v1/embeddings", llamaData, "POST")
@@ -612,18 +627,29 @@ func runServer(host string, port int) {
 	log.Fatal(http.ListenAndServe(addr, &OllamaHandler{}))
 }
 
-func main() {
-	port := DefaultPort
-	host := "0.0.0.0"
+func parseArgs() (port int, host string) {
+	port = DefaultPort
+	host = "0.0.0.0"
 
-	if len(os.Args) > 1 {
-		if p, err := strconv.Atoi(os.Args[1]); err == nil {
-			port = p
+	for _, arg := range os.Args[1:] {
+		switch arg {
+		case "-v":
+			verboseLevel = 1
+		case "-vv":
+			verboseLevel = 2
+		default:
+			if p, err := strconv.Atoi(arg); err == nil {
+				port = p
+			} else {
+				host = arg
+			}
 		}
 	}
-	if len(os.Args) > 2 {
-		host = os.Args[2]
-	}
+	return
+}
+
+func main() {
+	port, host := parseArgs()
 
 	runServer(host, port)
 }
