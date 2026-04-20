@@ -325,6 +325,11 @@ func (h *OllamaHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *OllamaHandler) handleGet(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/v1/") {
+		h.proxyRequest(w, r)
+		return
+	}
+
 	switch r.URL.Path {
 	case "/", "":
 		w.Header().Set("Content-Type", "text/plain")
@@ -341,6 +346,11 @@ func (h *OllamaHandler) handleGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *OllamaHandler) handlePost(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/v1/") {
+		h.proxyRequest(w, r)
+		return
+	}
+
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		sendError(w, "Failed to read request body", 400)
@@ -376,11 +386,58 @@ func (h *OllamaHandler) handlePost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *OllamaHandler) handleDelete(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/v1/") {
+		h.proxyRequest(w, r)
+		return
+	}
 	if r.URL.Path == "/api/delete" {
 		h.handleDeleteModel(w, r)
 	} else {
 		sendError(w, fmt.Sprintf("Unknown endpoint: %s", r.URL.Path), 404)
 	}
+}
+
+func (h *OllamaHandler) proxyRequest(w http.ResponseWriter, r *http.Request) {
+	url := llamaCPPURL + r.URL.Path
+	logVerbose("[PROXY] %s %s", r.Method, url)
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		sendError(w, "Failed to read request body", 400)
+		return
+	}
+	if len(body) > 0 {
+		logVeryVerbose("[PROXY] Body: %s", truncateString(string(body), 500))
+	}
+
+	req, err := http.NewRequest(r.Method, url, bytes.NewReader(body))
+	if err != nil {
+		sendError(w, "Failed to create proxy request", 500)
+		return
+	}
+	req.Header = r.Header.Clone()
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		logVeryVerbose("[PROXY] Error: %v", err)
+		sendError(w, fmt.Sprintf("Proxy request failed: %v", err), 502)
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		sendError(w, "Failed to read proxy response", 502)
+		return
+	}
+	logVeryVerbose("[PROXY] Response: %d bytes", len(respBody))
+
+	for k, v := range resp.Header {
+		w.Header()[k] = v
+	}
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBody)
 }
 
 func (h *OllamaHandler) handleTags(w http.ResponseWriter, r *http.Request) {
