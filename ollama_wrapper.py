@@ -308,21 +308,20 @@ class OllamaHandler(BaseHTTPRequestHandler):
     def handle_generate(self):
         try:
             req_body = self.request_body
-            print(
-                f"[DEBUG] handle_generate: model={req_body.get('model')}, prompt={req_body.get('prompt', '')[:50]}...")
-            sys.stdout.flush()
             model = req_body.get("model", "")
             prompt = req_body.get("prompt", "")
             stream = req_body.get("stream", True)
+            keep_alive = req_body.get("keep_alive", None)
 
-            print(f"[DEBUG] handle_generate: model={model}, prompt={prompt[:50] if prompt else ''}...")
+            print(f"[DEBUG] handle_generate: model={model}, keep_alive={keep_alive}")
             sys.stdout.flush()
 
             # Map to Llama.cpp completions endpoint
+            # Note: Force non-streaming for now - streaming not fully implemented
             llama_data = {
                 "prompt": prompt,
                 "model": model,
-                "stream": stream
+                "stream": False  # Always use non-streaming
             }
 
             # Map options if present
@@ -355,6 +354,13 @@ class OllamaHandler(BaseHTTPRequestHandler):
                     "done": True,
                     "done_reason": "stop"
                 })
+
+            # Handle keep_alive: 0 means unload model after request
+            if keep_alive == 0 or keep_alive == "0s":
+                print(f"[DEBUG] Unloading model: {model}")
+                sys.stdout.flush()
+                fetch_from_llama("/models/unload", {"model": model}, "POST")
+
         except Exception as e:
             self.send_error_json(str(e))
 
@@ -364,15 +370,16 @@ class OllamaHandler(BaseHTTPRequestHandler):
             model = req_body.get("model", "")
             messages = req_body.get("messages", [])
             stream = req_body.get("stream", True)
+            keep_alive = req_body.get("keep_alive", None)
 
-            print(f"[DEBUG] handle_chat: model={model}, messages={len(messages)}, stream={stream}")
+            print(f"[DEBUG] handle_chat: model={model}, keep_alive={keep_alive}")
             sys.stdout.flush()
 
             # Map to Llama.cpp chat completions endpoint
             llama_data = {
                 "model": model,
                 "messages": messages,
-                "stream": False  # Simplified: always non-stream for now
+                "stream": False  # Always use non-streaming
             }
 
             print(f"[DEBUG] handle_chat: calling fetch_from_llama with llama_data")
@@ -408,6 +415,13 @@ class OllamaHandler(BaseHTTPRequestHandler):
                 })
             else:
                 self.send_error_json("No response from model")
+
+            # Handle keep_alive: 0 means unload model after request
+            if keep_alive == 0 or keep_alive == "0s":
+                print(f"[DEBUG] Unloading model: {model}")
+                sys.stdout.flush()
+                fetch_from_llama("/models/unload", {"model": model}, "POST")
+
         except Exception as e:
             self.send_error_json(str(e))
 
@@ -501,7 +515,7 @@ if __name__ == "__main__":
     default_port = 11434
 
     if len(sys.argv) > 1:
-        pdefault_portort = int(sys.argv[1])
+        default_port = int(sys.argv[1])
     if len(sys.argv) > 2:
         default_host = sys.argv[2]
 
