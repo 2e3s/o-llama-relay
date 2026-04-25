@@ -18,9 +18,19 @@ Ollama client -> o_llama_wrapper (:11434) -> llama.cpp server (:8080)
 
 ```sh
 go build
+./o_llama_wrapper --port=1234
 ```
 
-No external dependencies.
+### Docker Compose
+
+```sh
+LLAMA_CPP_URL=http://host.docker.internal:8080 docker compose up --build
+```
+
+| Environment variable | Description |
+|---|---|
+| `OLLAMA_PORT` | External port to expose |
+| `LLAMA_CPP_URL` | llama.cpp server URL |
 
 ## Usage
 

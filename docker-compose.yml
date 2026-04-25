@@ -1,0 +1,8 @@
+services:
+  o_llama_wrapper:
+    build: .
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    environment:
+      - LLAMA_CPP_URL
+    command: ["-v"]
