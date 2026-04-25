@@ -1,12 +1,14 @@
-Some application nowadays have a proper support of Ollama, but they support llama.cpp only as OpenAI-compatible API despite its functional overlap with Ollama. This limits its capabilities for its local LLM management.
+# Llama.cpp as Ollama
 
-This application mimics Llama.cpp as Ollama, serving as a compatibility layer which mimics as Ollama instance and translates [Ollama](https://docs.ollama.com/api/introduction) REST endpoints into [llama.cpp](https://github.com/ggml-org/llama.cpp) server calls.
+Some application nowadays have a proper support of Ollama, but they support llama.cpp only as OpenAI-compatible API despite its functional overlap with Ollama. This limits its capabilities for its local LLM management, like detecting or unloading currently loaded models.
+
+This application mimics llama.cpp as Ollama, serving as a compatibility layer which mimics as Ollama instance and translates [Ollama](https://docs.ollama.com/api/introduction) REST endpoints into [llama.cpp](https://github.com/ggml-org/llama.cpp) server calls.
 
 
 ## How it works
 
 ```
-Ollama client -> o_llama_wrapper (:11434) -> llama.cpp server (:8080)
+Ollama client -> o_llama_relay (:11434) -> llama.cpp server (:8080)
 ```
 
 - **`/api/*` endpoints** — Translated from Ollama format to llama.cpp's OpenAI-compatible format.
@@ -18,7 +20,7 @@ Ollama client -> o_llama_wrapper (:11434) -> llama.cpp server (:8080)
 
 ```sh
 go build
-./o_llama_wrapper --port=1234
+./o_llama_relay --port=1234
 ```
 
 ### Docker Compose
@@ -35,7 +37,7 @@ LLAMA_CPP_URL=http://host.docker.internal:8080 docker compose up --build
 ## Usage
 
 ```sh
-./o_llama_wrapper [options] [port] [host]
+./o_llama_relay [options] [port] [host]
 ```
 
 Every parameter can be set via a CLI argument **or** an environment variable.

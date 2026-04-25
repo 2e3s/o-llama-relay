@@ -11,7 +11,7 @@ import (
 
 func runServer(host string, port int, handler *OllamaHandler) {
 	addr := fmt.Sprintf("%s:%d", host, port)
-	log.Printf("Ollama API wrapper running on %s", addr)
+	log.Printf("Ollama API relay running on %s", addr)
 	log.Printf("Proxying to Llama.cpp at %s", handler.Client.BaseURL)
 	log.Fatal(http.ListenAndServe(addr, handler))
 }

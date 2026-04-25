@@ -1,3 +1,3 @@
-module o_llama_wrapper
+module o_llama_relay
 
 go 1.26.2
