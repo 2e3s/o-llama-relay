@@ -1,23 +1,15 @@
 package main
 
-import (
-	"log"
-	"os"
-)
+import "log"
 
 const (
-	Version     = "0.1.0"
-	DefaultPort = 11434
+	Version         = "0.1.0"
+	DefaultPort     = 11434
+	DefaultHost     = "0.0.0.0"
+	DefaultLlamaURL = "http://127.0.0.1:8080"
 )
 
 var verboseLevel int // 0=silent, 1=verbose, 2=very verbose
-
-func getEnv(key, defaultVal string) string {
-	if val := os.Getenv(key); val != "" {
-		return val
-	}
-	return defaultVal
-}
 
 func logVerbose(format string, args ...any) {
 	if verboseLevel >= 1 {

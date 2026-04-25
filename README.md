@@ -1,5 +1,7 @@
-Some application nowadays have a proper support of Ollama, but they support llama.cpp only as OpenAI-compatible API despite a functional overlap with Ollama. This limits its capabilities for its local LLM management.
-This is a compatibility layer which mimics as Ollama instance and translates [Ollama](https://docs.ollama.com/api/introduction) REST endpoints into [llama.cpp](https://github.com/ggml-org/llama.cpp) server calls.
+Some application nowadays have a proper support of Ollama, but they support llama.cpp only as OpenAI-compatible API despite its functional overlap with Ollama. This limits its capabilities for its local LLM management.
+
+This application mimics Llama.cpp as Ollama, serving as a compatibility layer which mimics as Ollama instance and translates [Ollama](https://docs.ollama.com/api/introduction) REST endpoints into [llama.cpp](https://github.com/ggml-org/llama.cpp) server calls.
+
 
 ## How it works
 
@@ -23,18 +25,19 @@ No external dependencies.
 ## Usage
 
 ```sh
-./o_llama_wrapper [port] [host] [-v] [-vv]
+./o_llama_wrapper [options] [port] [host]
 ```
 
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `port` | Listen port | `11434` |
-| `host` | Listen address | `0.0.0.0` |
-| `-v` | Verbose logging (show request routing) | off |
-| `-vv` | Very verbose logging (show bodies/payloads) | off |
+Every parameter can be set via a CLI argument **or** an environment variable.
+CLI arguments take priority over environment variables.
 
-### Environment variables
+| CLI argument | Environment variable | Description | Default |
+|---|---|---|---|
+| `--port <n>` or positional number | `OLLAMA_PORT` | Listen port | `11434` |
+| `--host <addr>` or positional string | `OLLAMA_HOST` | Listen address | `0.0.0.0` |
+| `--llama-cpp-url <url>` | `LLAMA_CPP_URL` | llama.cpp server base URL | `http://127.0.0.1:8080` |
+| `-v` | — | Verbose logging (show request routing) | off |
+| `-vv` | — | Very verbose logging (show bodies/payloads) | off |
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LLAMA_CPP_URL` | llama.cpp server base URL | `http://127.0.0.1:8080` |
+Positional arguments are supported for backward compatibility: a bare number
+is treated as the port, a bare string as the host address.
