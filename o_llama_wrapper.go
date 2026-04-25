@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,13 +33,13 @@ func getEnv(key, defaultVal string) string {
 	return defaultVal
 }
 
-func logVerbose(format string, args ...interface{}) {
+func logVerbose(format string, args ...any) {
 	if verboseLevel >= 1 {
 		log.Printf(format, args...)
 	}
 }
 
-func logVeryVerbose(format string, args ...interface{}) {
+func logVeryVerbose(format string, args ...any) {
 	if verboseLevel >= 2 {
 		log.Printf(format, args...)
 	}
@@ -47,7 +49,7 @@ type ErrorResponse struct {
 	Error string `json:"error"`
 }
 
-func sendJSON(w http.ResponseWriter, data interface{}, status int) {
+func sendJSON(w http.ResponseWriter, data any, status int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
@@ -57,13 +59,17 @@ func sendError(w http.ResponseWriter, message string, status int) {
 	sendJSON(w, ErrorResponse{Error: message}, status)
 }
 
-func fetchFromLlama(path string, data interface{}, method string) (map[string]interface{}, error) {
+func doLlamaRequest(path string, data any, method string, stream bool) (*http.Response, error) {
 	url := llamaCPPURL + path
 	logVerbose("[LLAMA] %s %s", method, url)
 
 	var body []byte
+	var err error
 	if data != nil {
-		body, _ = json.Marshal(data)
+		body, err = json.Marshal(data)
+		if err != nil {
+			return nil, err
+		}
 		logVeryVerbose("[LLAMA] Payload: %s", string(body))
 	}
 
@@ -74,26 +80,493 @@ func fetchFromLlama(path string, data interface{}, method string) (map[string]in
 	req.Header.Set("Content-Type", "application/json")
 
 	logVeryVerbose("[LLAMA] Opening URL, waiting for response...")
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{}
+	if !stream {
+		client.Timeout = 60 * time.Second
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		logVerbose("[LLAMA] URLError: %v", err)
 		return nil, fmt.Errorf("failed to reach Llama.cpp server: %v", err)
 	}
-	defer resp.Body.Close()
+	logVeryVerbose("[LLAMA] Got response with status: %s", resp.Status)
 
-	logVeryVerbose("[LLAMA] Got response, reading...")
+	return resp, nil
+}
+
+func readLlamaError(resp *http.Response) error {
+	result, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("llama.cpp returned status %d", resp.StatusCode)
+	}
+	logVeryVerbose("[LLAMA] Error response received: %d bytes", len(result))
+
+	var dataMap map[string]any
+	if err := json.Unmarshal(result, &dataMap); err == nil {
+		if errorString, ok := dataMap["error"].(string); ok && errorString != "" {
+			return fmt.Errorf("llama.cpp returned status %d: %s", resp.StatusCode, errorString)
+		}
+		if errorMap, ok := dataMap["error"].(map[string]any); ok {
+			if message, ok := errorMap["message"].(string); ok && message != "" {
+				return fmt.Errorf("llama.cpp returned status %d: %s", resp.StatusCode, message)
+			}
+		}
+		if message, ok := dataMap["message"].(string); ok && message != "" {
+			return fmt.Errorf("llama.cpp returned status %d: %s", resp.StatusCode, message)
+		}
+	}
+
+	if message := strings.TrimSpace(string(result)); message != "" {
+		return fmt.Errorf("llama.cpp returned status %d: %s", resp.StatusCode, message)
+	}
+
+	return fmt.Errorf("llama.cpp returned status %d", resp.StatusCode)
+}
+
+func readLlamaJSON(resp *http.Response) (map[string]any, error) {
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, readLlamaError(resp)
+	}
+
+	logVeryVerbose("[LLAMA] Reading response body...")
 	result, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
 	logVeryVerbose("[LLAMA] Response received: %d bytes", len(result))
 
-	var dataMap map[string]interface{}
+	var dataMap map[string]any
 	if err := json.Unmarshal(result, &dataMap); err != nil {
 		return nil, err
 	}
 	return dataMap, nil
+}
+
+func fetchFromLlama(path string, data any, method string) (map[string]any, error) {
+	resp, err := doLlamaRequest(path, data, method, false)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	return readLlamaJSON(resp)
+}
+
+func writeStreamChunk(encoder *json.Encoder, flusher http.Flusher, data any) error {
+	if err := encoder.Encode(data); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
+func consumeSSE(body io.Reader, handle func(string) error) error {
+	scanner := bufio.NewScanner(body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	dataLines := []string{}
+	processEvent := func() error {
+		if len(dataLines) == 0 {
+			return nil
+		}
+		payload := strings.Join(dataLines, "\n")
+		dataLines = dataLines[:0]
+		return handle(payload)
+	}
+
+	for scanner.Scan() {
+		line := strings.TrimRight(scanner.Text(), "\r")
+		switch {
+		case line == "":
+			if err := processEvent(); err != nil {
+				return err
+			}
+		case strings.HasPrefix(line, ":"):
+			continue
+		case strings.HasPrefix(line, "data:"):
+			dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	return processEvent()
+}
+
+func firstChoice(chunk map[string]any) map[string]any {
+	choices, ok := chunk["choices"].([]any)
+	if !ok || len(choices) == 0 {
+		return nil
+	}
+
+	choice, ok := choices[0].(map[string]any)
+	if !ok {
+		return nil
+	}
+
+	return choice
+}
+
+func choiceFinishReason(choice map[string]any) string {
+	if choice == nil {
+		return ""
+	}
+
+	finishReason, _ := choice["finish_reason"].(string)
+	return finishReason
+}
+
+func buildGenerateStreamChunk(model, createdAt string, chunk map[string]any) (map[string]any, string, bool) {
+	choice := firstChoice(chunk)
+	if choice == nil {
+		return nil, "", false
+	}
+
+	text, _ := choice["text"].(string)
+	finishReason := choiceFinishReason(choice)
+	if text == "" {
+		return nil, finishReason, false
+	}
+
+	return map[string]any{
+		"model":      model,
+		"created_at": createdAt,
+		"response":   text,
+		"done":       false,
+	}, finishReason, true
+}
+
+func buildGenerateFinalChunk(model, createdAt, doneReason string) map[string]any {
+	if doneReason == "" {
+		doneReason = "stop"
+	}
+
+	return map[string]any{
+		"model":       model,
+		"created_at":  createdAt,
+		"response":    "",
+		"done":        true,
+		"done_reason": doneReason,
+	}
+}
+
+type chatToolCallAccumulator struct {
+	ID                    string
+	Index                 int
+	Name                  string
+	argumentsBuffer       strings.Builder
+	arguments             map[string]any
+	hasStructuredArgs     bool
+	emittedToClientStream bool
+}
+
+type chatToolCallState struct {
+	calls map[int]*chatToolCallAccumulator
+}
+
+func newChatToolCallState() *chatToolCallState {
+	return &chatToolCallState{
+		calls: make(map[int]*chatToolCallAccumulator),
+	}
+}
+
+func (s *chatToolCallState) apply(rawToolCalls []any) {
+	for i, rawToolCall := range rawToolCalls {
+		toolCall, ok := rawToolCall.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		index := i
+		switch v := toolCall["index"].(type) {
+		case float64:
+			index = int(v)
+		case int:
+			index = v
+		}
+
+		accumulator := s.calls[index]
+		if accumulator == nil {
+			accumulator = &chatToolCallAccumulator{Index: index}
+			s.calls[index] = accumulator
+		}
+
+		if id, ok := toolCall["id"].(string); ok && id != "" {
+			accumulator.ID = id
+		}
+
+		function, ok := toolCall["function"].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if name, ok := function["name"].(string); ok && name != "" {
+			if accumulator.Name == "" || strings.HasPrefix(name, accumulator.Name) {
+				accumulator.Name = name
+			} else {
+				accumulator.Name += name
+			}
+		}
+
+		switch arguments := function["arguments"].(type) {
+		case string:
+			accumulator.argumentsBuffer.WriteString(arguments)
+		case map[string]any:
+			accumulator.arguments = arguments
+			accumulator.hasStructuredArgs = true
+		case nil:
+		default:
+			rawArguments, err := json.Marshal(arguments)
+			if err != nil {
+				continue
+			}
+
+			var parsedArguments map[string]any
+			if err := json.Unmarshal(rawArguments, &parsedArguments); err != nil {
+				continue
+			}
+
+			accumulator.arguments = parsedArguments
+			accumulator.hasStructuredArgs = true
+		}
+	}
+}
+
+func (s *chatToolCallState) readyForClient(allowEmptyArgs bool) []map[string]any {
+	indexes := make([]int, 0, len(s.calls))
+	for index := range s.calls {
+		indexes = append(indexes, index)
+	}
+	sort.Ints(indexes)
+
+	toolCalls := []map[string]any{}
+	for _, index := range indexes {
+		accumulator := s.calls[index]
+		if accumulator.emittedToClientStream {
+			continue
+		}
+
+		toolCall, ok := accumulator.toOllamaToolCall(allowEmptyArgs)
+		if !ok {
+			continue
+		}
+
+		accumulator.emittedToClientStream = true
+		toolCalls = append(toolCalls, toolCall)
+	}
+
+	return toolCalls
+}
+
+func (a *chatToolCallAccumulator) toOllamaToolCall(allowEmptyArgs bool) (map[string]any, bool) {
+	if a.Name == "" {
+		return nil, false
+	}
+
+	arguments, ok := a.argumentsMap(allowEmptyArgs)
+	if !ok {
+		return nil, false
+	}
+
+	toolCall := map[string]any{
+		"function": map[string]any{
+			"index":     a.Index,
+			"name":      a.Name,
+			"arguments": arguments,
+		},
+	}
+	if a.ID != "" {
+		toolCall["id"] = a.ID
+	}
+
+	return toolCall, true
+}
+
+func (a *chatToolCallAccumulator) argumentsMap(allowEmptyArgs bool) (map[string]any, bool) {
+	if a.hasStructuredArgs {
+		return a.arguments, true
+	}
+
+	rawArguments := strings.TrimSpace(a.argumentsBuffer.String())
+	if rawArguments == "" {
+		if allowEmptyArgs {
+			return map[string]any{}, true
+		}
+		return nil, false
+	}
+
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(rawArguments), &arguments); err != nil {
+		return nil, false
+	}
+
+	return arguments, true
+}
+
+func chatMessageFromChoice(choice map[string]any, toolCallState *chatToolCallState, allowEmptyToolArgs bool) (map[string]any, bool) {
+	var source map[string]any
+	if delta, ok := choice["delta"].(map[string]any); ok {
+		source = delta
+	} else if message, ok := choice["message"].(map[string]any); ok {
+		source = message
+	}
+	if source == nil {
+		return nil, false
+	}
+
+	role, _ := source["role"].(string)
+	content, _ := source["content"].(string)
+	thinking := ""
+	if value, ok := source["thinking"].(string); ok && value != "" {
+		thinking = value
+	} else if value, ok := source["reasoning"].(string); ok && value != "" {
+		thinking = value
+	}
+
+	if rawToolCalls, ok := source["tool_calls"].([]any); ok {
+		toolCallState.apply(rawToolCalls)
+	}
+	toolCalls := toolCallState.readyForClient(allowEmptyToolArgs)
+
+	hasPayload := content != "" || thinking != "" || len(toolCalls) > 0
+	if !hasPayload {
+		return nil, false
+	}
+	if role == "" {
+		role = "assistant"
+	}
+
+	message := map[string]any{
+		"role": role,
+	}
+	if content != "" {
+		message["content"] = content
+	}
+	if thinking != "" {
+		message["thinking"] = thinking
+	}
+	if len(toolCalls) > 0 {
+		message["tool_calls"] = toolCalls
+	}
+
+	return message, true
+}
+
+func buildChatStreamChunk(model, createdAt string, chunk map[string]any, toolCallState *chatToolCallState) (map[string]any, string, bool) {
+	choice := firstChoice(chunk)
+	if choice == nil {
+		return nil, "", false
+	}
+
+	finishReason := choiceFinishReason(choice)
+	message, emit := chatMessageFromChoice(choice, toolCallState, finishReason != "")
+	if !emit {
+		return nil, finishReason, false
+	}
+
+	return map[string]any{
+		"model":      model,
+		"created_at": createdAt,
+		"message":    message,
+		"done":       false,
+	}, finishReason, true
+}
+
+func buildChatFinalChunk(model, createdAt, doneReason string) map[string]any {
+	if doneReason == "" {
+		doneReason = "stop"
+	}
+
+	return map[string]any{
+		"model":      model,
+		"created_at": createdAt,
+		"message": map[string]any{
+			"role":    "assistant",
+			"content": "",
+		},
+		"done":        true,
+		"done_reason": doneReason,
+	}
+}
+
+func streamLlamaResponse(
+	w http.ResponseWriter,
+	path string,
+	data any,
+	method string,
+	model string,
+	buildChunk func(string, string, map[string]any) (map[string]any, string, bool),
+	buildFinal func(string, string, string) map[string]any,
+) error {
+	resp, err := doLlamaRequest(path, data, method, true)
+	if err != nil {
+		sendError(w, err.Error(), 500)
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		err = readLlamaError(resp)
+		sendError(w, err.Error(), 500)
+		return err
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		err = fmt.Errorf("response writer does not support streaming")
+		sendError(w, err.Error(), 500)
+		return err
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	createdAt := time.Now().UTC().Format(time.RFC3339)
+	encoder := json.NewEncoder(w)
+	doneReason := "stop"
+	finalSent := false
+
+	err = consumeSSE(resp.Body, func(payload string) error {
+		if payload == "[DONE]" {
+			if finalSent {
+				return nil
+			}
+			finalSent = true
+			return writeStreamChunk(encoder, flusher, buildFinal(model, createdAt, doneReason))
+		}
+
+		var chunk map[string]any
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			return err
+		}
+
+		responseChunk, finishReason, emit := buildChunk(model, createdAt, chunk)
+		if finishReason != "" {
+			doneReason = finishReason
+		}
+		if emit {
+			if err := writeStreamChunk(encoder, flusher, responseChunk); err != nil {
+				return err
+			}
+		}
+		if finishReason != "" && !finalSent {
+			finalSent = true
+			return writeStreamChunk(encoder, flusher, buildFinal(model, createdAt, doneReason))
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	if !finalSent {
+		return writeStreamChunk(encoder, flusher, buildFinal(model, createdAt, doneReason))
+	}
+
+	return nil
 }
 
 func extractModelPath(args []string) string {
@@ -189,17 +662,17 @@ func parseModelDetails(filename string) map[string]string {
 	return details
 }
 
-func llamaToOllamaTags(llamaData map[string]interface{}) map[string]interface{} {
-	models := []map[string]interface{}{}
+func llamaToOllamaTags(llamaData map[string]any) map[string]any {
+	models := []map[string]any{}
 
-	for _, m := range llamaData["data"].([]interface{}) {
-		modelMap := m.(map[string]interface{})
+	for _, m := range llamaData["data"].([]any) {
+		modelMap := m.(map[string]any)
 		modelID, _ := modelMap["id"].(string)
-		status, _ := modelMap["status"].(map[string]interface{})
+		status, _ := modelMap["status"].(map[string]any)
 
 		var args []string
 		if status != nil {
-			if a, ok := status["args"].([]interface{}); ok {
+			if a, ok := status["args"].([]any); ok {
 				for _, v := range a {
 					args = append(args, fmt.Sprintf("%v", v))
 				}
@@ -238,7 +711,7 @@ func llamaToOllamaTags(llamaData map[string]interface{}) map[string]interface{} 
 		created := modelMap["created"].(float64)
 		modifiedAt := time.Unix(int64(created), 0).UTC().Format(time.RFC3339)
 
-		modelEntry := map[string]interface{}{
+		modelEntry := map[string]any{
 			"name":        modelID,
 			"model":       modelID,
 			"modified_at": modifiedAt,
@@ -249,15 +722,15 @@ func llamaToOllamaTags(llamaData map[string]interface{}) map[string]interface{} 
 		models = append(models, modelEntry)
 	}
 
-	return map[string]interface{}{"models": models}
+	return map[string]any{"models": models}
 }
 
-func llamaToOllamaPS(llamaData map[string]interface{}) map[string]interface{} {
-	models := []map[string]interface{}{}
+func llamaToOllamaPS(llamaData map[string]any) map[string]any {
+	models := []map[string]any{}
 
-	for _, m := range llamaData["data"].([]interface{}) {
-		modelMap := m.(map[string]interface{})
-		status, _ := modelMap["status"].(map[string]interface{})
+	for _, m := range llamaData["data"].([]any) {
+		modelMap := m.(map[string]any)
+		status, _ := modelMap["status"].(map[string]any)
 
 		if status == nil || status["value"] != "loaded" {
 			continue
@@ -266,7 +739,7 @@ func llamaToOllamaPS(llamaData map[string]interface{}) map[string]interface{} {
 		modelID, _ := modelMap["id"].(string)
 
 		var args []string
-		if a, ok := status["args"].([]interface{}); ok {
+		if a, ok := status["args"].([]any); ok {
 			for _, v := range a {
 				args = append(args, fmt.Sprintf("%v", v))
 			}
@@ -285,7 +758,7 @@ func llamaToOllamaPS(llamaData map[string]interface{}) map[string]interface{} {
 		expiresAt := time.Now().UTC().Add(time.Duration(sleepSeconds) * time.Second)
 		expiresAt = expiresAt.Truncate(time.Minute)
 
-		modelEntry := map[string]interface{}{
+		modelEntry := map[string]any{
 			"name":   modelID,
 			"model":  modelID,
 			"size":   0,
@@ -304,7 +777,7 @@ func llamaToOllamaPS(llamaData map[string]interface{}) map[string]interface{} {
 		models = append(models, modelEntry)
 	}
 
-	return map[string]interface{}{"models": models}
+	return map[string]any{"models": models}
 }
 
 type OllamaHandler struct{}
@@ -358,9 +831,9 @@ func (h *OllamaHandler) handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 	logVeryVerbose("[OLLAMA] POST body: %s", truncateString(string(body), 500))
 
-	var reqBody map[string]interface{}
+	var reqBody map[string]any
 	if err := json.Unmarshal(body, &reqBody); err != nil {
-		reqBody = make(map[string]interface{})
+		reqBody = make(map[string]any)
 	}
 
 	switch r.URL.Path {
@@ -417,7 +890,11 @@ func (h *OllamaHandler) proxyRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Header = r.Header.Clone()
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	stream := requestBodyWantsStream(body) || strings.Contains(req.Header.Get("Accept"), "text/event-stream")
+	client := &http.Client{}
+	if !stream {
+		client.Timeout = 60 * time.Second
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		logVeryVerbose("[PROXY] Error: %v", err)
@@ -425,19 +902,21 @@ func (h *OllamaHandler) proxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		sendError(w, "Failed to read proxy response", 502)
-		return
-	}
-	logVeryVerbose("[PROXY] Response: %d bytes", len(respBody))
+	logVeryVerbose("[PROXY] Response status: %s", resp.Status)
 
 	for k, v := range resp.Header {
 		w.Header()[k] = v
 	}
 	w.WriteHeader(resp.StatusCode)
-	w.Write(respBody)
+
+	if flusher, ok := w.(http.Flusher); ok {
+		_, err = io.Copy(flushWriter{ResponseWriter: w, Flusher: flusher}, resp.Body)
+	} else {
+		_, err = io.Copy(w, resp.Body)
+	}
+	if err != nil {
+		logVeryVerbose("[PROXY] Stream copy error: %v", err)
+	}
 }
 
 func (h *OllamaHandler) handleTags(w http.ResponseWriter, r *http.Request) {
@@ -460,39 +939,88 @@ func (h *OllamaHandler) handlePS(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, result, 200)
 }
 
-func (h *OllamaHandler) handleGenerate(w http.ResponseWriter, reqBody map[string]interface{}) {
+func wantsStream(reqBody map[string]any) bool {
+	stream, ok := reqBody["stream"].(bool)
+	return ok && stream
+}
+
+func requestBodyWantsStream(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+
+	var reqBody map[string]any
+	if err := json.Unmarshal(body, &reqBody); err != nil {
+		return false
+	}
+
+	return wantsStream(reqBody)
+}
+
+func applyCommonOptions(llamaData map[string]any, options map[string]any) {
+	if temp, ok := options["temperature"].(float64); ok {
+		llamaData["temperature"] = temp
+	}
+	if topP, ok := options["top_p"].(float64); ok {
+		llamaData["top_p"] = topP
+	}
+	if topK, ok := options["top_k"].(float64); ok {
+		llamaData["top_k"] = topK
+	}
+	if numPredict, ok := options["num_predict"].(float64); ok {
+		llamaData["max_tokens"] = int(numPredict)
+	} else if maxTokens, ok := options["max_tokens"].(float64); ok {
+		llamaData["max_tokens"] = int(maxTokens)
+	}
+}
+
+func unloadModel(model string) {
+	logVerbose("[DEBUG] Unloading model: %s", model)
+	if _, err := fetchFromLlama("/models/unload", map[string]string{"model": model}, "POST"); err != nil {
+		logVerbose("[DEBUG] Failed to unload model %s: %v", model, err)
+	}
+}
+
+func (h *OllamaHandler) handleGenerate(w http.ResponseWriter, reqBody map[string]any) {
 	model, _ := reqBody["model"].(string)
 	prompt, _ := reqBody["prompt"].(string)
 	keepAlive := reqBody["keep_alive"]
+	stream := wantsStream(reqBody)
 
-	llamaData := map[string]interface{}{
+	llamaData := map[string]any{
 		"prompt": prompt,
 		"model":  model,
-		"stream": false,
+		"stream": stream,
 	}
 
-	if options, ok := reqBody["options"].(map[string]interface{}); ok {
-		if temp, ok := options["temperature"].(float64); ok {
-			llamaData["temperature"] = temp
-		}
-		if topP, ok := options["top_p"].(float64); ok {
-			llamaData["top_p"] = topP
-		}
-		if topK, ok := options["top_k"].(float64); ok {
-			llamaData["top_k"] = topK
-		}
-		if numPredict, ok := options["num_predict"].(float64); ok {
-			llamaData["max_tokens"] = int(numPredict)
-		} else if maxTokens, ok := options["max_tokens"].(float64); ok {
-			llamaData["max_tokens"] = int(maxTokens)
-		}
-		if stop, ok := options["stop"].([]interface{}); ok {
+	if options, ok := reqBody["options"].(map[string]any); ok {
+		applyCommonOptions(llamaData, options)
+		if stop, ok := options["stop"].([]any); ok {
 			stopSlice := make([]string, len(stop))
 			for i, s := range stop {
 				stopSlice[i] = fmt.Sprintf("%v", s)
 			}
 			llamaData["stop"] = stopSlice
 		}
+	}
+
+	if stream {
+		if err := streamLlamaResponse(
+			w,
+			"/v1/completions",
+			llamaData,
+			"POST",
+			model,
+			buildGenerateStreamChunk,
+			buildGenerateFinalChunk,
+		); err != nil {
+			logVerbose("[OLLAMA] Generate stream failed: %v", err)
+			return
+		}
+		if shouldUnload(keepAlive) {
+			unloadModel(model)
+		}
+		return
 	}
 
 	result, err := fetchFromLlama("/v1/completions", llamaData, "POST")
@@ -502,53 +1030,66 @@ func (h *OllamaHandler) handleGenerate(w http.ResponseWriter, reqBody map[string
 	}
 
 	response := ""
-	if choices, ok := result["choices"].([]interface{}); ok && len(choices) > 0 {
-		if choice, ok := choices[0].(map[string]interface{}); ok {
+	doneReason := "stop"
+	if choices, ok := result["choices"].([]any); ok && len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]any); ok {
 			response, _ = choice["text"].(string)
+			if finishReason := choiceFinishReason(choice); finishReason != "" {
+				doneReason = finishReason
+			}
 		}
 	}
 
-	sendJSON(w, map[string]interface{}{
+	sendJSON(w, map[string]any{
 		"model":       model,
 		"created_at":  time.Now().UTC().Format(time.RFC3339),
 		"response":    response,
 		"done":        true,
-		"done_reason": "stop",
+		"done_reason": doneReason,
 	}, 200)
 
 	// Handle keep_alive: 0 means unload model
 	if shouldUnload(keepAlive) {
-		logVerbose("[DEBUG] Unloading model: %s", model)
-		fetchFromLlama("/models/unload", map[string]string{"model": model}, "POST")
+		unloadModel(model)
 	}
 }
 
-func (h *OllamaHandler) handleChat(w http.ResponseWriter, reqBody map[string]interface{}) {
+func (h *OllamaHandler) handleChat(w http.ResponseWriter, reqBody map[string]any) {
 	model, _ := reqBody["model"].(string)
-	messages, _ := reqBody["messages"].([]interface{})
+	messages, _ := reqBody["messages"].([]any)
 	keepAlive := reqBody["keep_alive"]
+	stream := wantsStream(reqBody)
 
-	llamaData := map[string]interface{}{
+	llamaData := map[string]any{
 		"model":    model,
 		"messages": messages,
-		"stream":   false,
+		"stream":   stream,
 	}
 
-	if options, ok := reqBody["options"].(map[string]interface{}); ok {
-		if temp, ok := options["temperature"].(float64); ok {
-			llamaData["temperature"] = temp
+	if options, ok := reqBody["options"].(map[string]any); ok {
+		applyCommonOptions(llamaData, options)
+	}
+
+	if stream {
+		toolCallState := newChatToolCallState()
+		if err := streamLlamaResponse(
+			w,
+			"/v1/chat/completions",
+			llamaData,
+			"POST",
+			model,
+			func(model, createdAt string, chunk map[string]any) (map[string]any, string, bool) {
+				return buildChatStreamChunk(model, createdAt, chunk, toolCallState)
+			},
+			buildChatFinalChunk,
+		); err != nil {
+			logVerbose("[OLLAMA] Chat stream failed: %v", err)
+			return
 		}
-		if topP, ok := options["top_p"].(float64); ok {
-			llamaData["top_p"] = topP
+		if shouldUnload(keepAlive) {
+			unloadModel(model)
 		}
-		if topK, ok := options["top_k"].(float64); ok {
-			llamaData["top_k"] = topK
-		}
-		if numPredict, ok := options["num_predict"].(float64); ok {
-			llamaData["max_tokens"] = int(numPredict)
-		} else if maxTokens, ok := options["max_tokens"].(float64); ok {
-			llamaData["max_tokens"] = int(maxTokens)
-		}
+		return
 	}
 
 	result, err := fetchFromLlama("/v1/chat/completions", llamaData, "POST")
@@ -557,31 +1098,40 @@ func (h *OllamaHandler) handleChat(w http.ResponseWriter, reqBody map[string]int
 		return
 	}
 
-	content := ""
-	if choices, ok := result["choices"].([]interface{}); ok && len(choices) > 0 {
-		if choice, ok := choices[0].(map[string]interface{}); ok {
-			if msg, ok := choice["message"].(map[string]interface{}); ok {
-				content, _ = msg["content"].(string)
+	message := map[string]any{
+		"role":    "assistant",
+		"content": "",
+	}
+	doneReason := "stop"
+	if choices, ok := result["choices"].([]any); ok && len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]any); ok {
+			toolCallState := newChatToolCallState()
+			if translatedMessage, ok := chatMessageFromChoice(choice, toolCallState, true); ok {
+				message = translatedMessage
+			}
+			if finishReason := choiceFinishReason(choice); finishReason != "" {
+				doneReason = finishReason
+			} else if _, ok := message["tool_calls"]; ok {
+				doneReason = "tool_calls"
 			}
 		}
 	}
 
-	sendJSON(w, map[string]interface{}{
+	sendJSON(w, map[string]any{
 		"model":       model,
 		"created_at":  time.Now().UTC().Format(time.RFC3339),
-		"message":     map[string]string{"role": "assistant", "content": content},
+		"message":     message,
 		"done":        true,
-		"done_reason": "stop",
+		"done_reason": doneReason,
 	}, 200)
 
 	// Handle keep_alive: 0 means unload model
 	if shouldUnload(keepAlive) {
-		logVerbose("[DEBUG] Unloading model: %s", model)
-		fetchFromLlama("/models/unload", map[string]string{"model": model}, "POST")
+		unloadModel(model)
 	}
 }
 
-func (h *OllamaHandler) handleEmbed(w http.ResponseWriter, reqBody map[string]interface{}) {
+func (h *OllamaHandler) handleEmbed(w http.ResponseWriter, reqBody map[string]any) {
 	model, _ := reqBody["model"].(string)
 	input, _ := reqBody["input"]
 
@@ -589,7 +1139,7 @@ func (h *OllamaHandler) handleEmbed(w http.ResponseWriter, reqBody map[string]in
 	switch v := input.(type) {
 	case string:
 		inputList = append(inputList, v)
-	case []interface{}:
+	case []any:
 		for _, item := range v {
 			if s, ok := item.(string); ok {
 				inputList = append(inputList, s)
@@ -597,7 +1147,7 @@ func (h *OllamaHandler) handleEmbed(w http.ResponseWriter, reqBody map[string]in
 		}
 	}
 
-	llamaData := map[string]interface{}{
+	llamaData := map[string]any{
 		"model": model,
 		"input": inputList,
 	}
@@ -609,10 +1159,10 @@ func (h *OllamaHandler) handleEmbed(w http.ResponseWriter, reqBody map[string]in
 	}
 
 	embeddings := [][]float64{}
-	if data, ok := result["data"].([]interface{}); ok {
+	if data, ok := result["data"].([]any); ok {
 		for _, item := range data {
-			if m, ok := item.(map[string]interface{}); ok {
-				if emb, ok := m["embedding"].([]interface{}); ok {
+			if m, ok := item.(map[string]any); ok {
+				if emb, ok := m["embedding"].([]any); ok {
 					embFloat := make([]float64, len(emb))
 					for i, v := range emb {
 						if f, ok := v.(float64); ok {
@@ -625,13 +1175,13 @@ func (h *OllamaHandler) handleEmbed(w http.ResponseWriter, reqBody map[string]in
 		}
 	}
 
-	sendJSON(w, map[string]interface{}{
+	sendJSON(w, map[string]any{
 		"model":      model,
 		"embeddings": embeddings,
 	}, 200)
 }
 
-func (h *OllamaHandler) handleShow(w http.ResponseWriter, reqBody map[string]interface{}) {
+func (h *OllamaHandler) handleShow(w http.ResponseWriter, reqBody map[string]any) {
 	model, _ := reqBody["model"].(string)
 
 	llamaData := map[string]string{"model": model}
@@ -641,7 +1191,7 @@ func (h *OllamaHandler) handleShow(w http.ResponseWriter, reqBody map[string]int
 		return
 	}
 
-	sendJSON(w, map[string]interface{}{
+	sendJSON(w, map[string]any{
 		"model":       model,
 		"modified_at": time.Now().UTC().Format(time.RFC3339),
 		"details": map[string]string{
@@ -655,7 +1205,7 @@ func (h *OllamaHandler) handleDeleteModel(w http.ResponseWriter, r *http.Request
 	sendError(w, "Model deletion not supported - Llama.cpp uses pre-loaded models", 501)
 }
 
-func shouldUnload(keepAlive interface{}) bool {
+func shouldUnload(keepAlive any) bool {
 	if keepAlive == nil {
 		return false
 	}
@@ -668,6 +1218,19 @@ func shouldUnload(keepAlive interface{}) bool {
 		return v == 0
 	}
 	return false
+}
+
+type flushWriter struct {
+	http.ResponseWriter
+	http.Flusher
+}
+
+func (w flushWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if err == nil {
+		w.Flusher.Flush()
+	}
+	return n, err
 }
 
 func truncateString(s string, maxLen int) string {

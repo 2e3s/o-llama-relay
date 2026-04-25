@@ -7,8 +7,10 @@ This is a compatibility layer which mimics as Ollama instance and translates [Ol
 Ollama client -> o_llama_wrapper (:11434) -> llama.cpp server (:8080)
 ```
 
-- **`/api/*` endpoints** — Translated from Ollama format to llama.cpp's OpenAI-compatible format
-- **`/v1/*` endpoints** — Forwarded verbatim to llama.cpp without transformation
+- **`/api/*` endpoints** — Translated from Ollama format to llama.cpp's OpenAI-compatible format.
+- **`/v1/*` endpoints** — Forwarded to llama.cpp without transformation.
+- **Streaming** — `stream: true` is supported for translated `/api/generate` and `/api/chat` requests.
+- **unloading** - Supported by `keep_alive: 0`.
 
 ## Build
 
