@@ -177,6 +177,8 @@ func chatMessageFromChoice(choice map[string]any, toolCallState *chatToolCallSta
 	thinking := ""
 	if value, ok := source["thinking"].(string); ok && value != "" {
 		thinking = value
+	} else if value, ok := source["reasoning_content"].(string); ok && value != "" {
+		thinking = value
 	} else if value, ok := source["reasoning"].(string); ok && value != "" {
 		thinking = value
 	}
