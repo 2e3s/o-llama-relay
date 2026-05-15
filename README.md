@@ -26,7 +26,13 @@ go build
 ### Docker Compose
 
 ```sh
+git clone https://github.com/2e3s/o-llama-relay && cd o-llama-relay
 LLAMA_CPP_URL=http://host.docker.internal:8080 docker compose up --build
+```
+Or keep the variables in `.env` file:
+```
+LLAMA_CPP_URL=http://host.docker.internal:8080
+OLLAMA_PORT=12345
 ```
 
 | Environment variable | Description |
