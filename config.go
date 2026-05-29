@@ -3,7 +3,7 @@ package main
 import "log"
 
 const (
-	Version         = "0.1.0"
+	Version         = "0.20.0"
 	DefaultPort     = 11434
 	DefaultHost     = "0.0.0.0"
 	DefaultLlamaURL = "http://127.0.0.1:8080"
