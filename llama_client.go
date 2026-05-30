@@ -64,6 +64,7 @@ func (c *LlamaClient) readError(resp *http.Response) error {
 		return fmt.Errorf("llama.cpp returned status %d", resp.StatusCode)
 	}
 	logVeryVerbose("[LLAMA] Error response received: %d bytes", len(result))
+	logVeryVerbose("[LLAMA] Error response: %s", string(result))
 
 	var dataMap map[string]any
 	if err := json.Unmarshal(result, &dataMap); err == nil {
